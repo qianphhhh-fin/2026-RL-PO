@@ -8,7 +8,7 @@ from env import PortfolioEnv
 from dmpo_model import PortfolioTransformerExtractor, DMPOActionWrapper
 
 def main():
-    log_dir = "./dmpo_logs/"
+    log_dir = "dmpo_tensorboard"
     os.makedirs(log_dir, exist_ok=True)
     
     # 1. 组装环境
@@ -44,7 +44,7 @@ def main():
     print("🚀 开始训练 Transformer-DMPO (Simulated FF5 Data)...")
     try:
         # 建议训练至少 100k 步
-        model.learn(total_timesteps=100000)
+        model.learn(total_timesteps=200000)
         
         model.save("dmpo_transformer_agent")
         env.save("vec_normalize.pkl")
