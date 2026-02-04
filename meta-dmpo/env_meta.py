@@ -31,8 +31,11 @@ class MetaSyntheticEnv(gym.Env):
         # 观察空间：
         # 1. 市场特征 (Vol, Returns)
         # 2. 各个 Alpha 过去一段时间的预测值 vs 真实值 (让 RL 学会谁准)
-        # 为了 MVP 简单化，我们先只给 Alpha 的当期预测值 + 历史收益特征
-        obs_dim = (self.n_assets * self.lookback) + (self.n_alphas * self.n_assets)
+# 3. [新增] 过去一段时间各 Alpha 的预测误差 (MSE) -> shape (n_alphas,)
+        obs_dim = (self.n_assets * self.lookback) + \
+                  (self.n_alphas * self.n_assets) + \
+                  self.n_alphas  # <--- 新增这行，给每个 Alpha 一个评分位
+        
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
         
         self.reset()
@@ -75,13 +78,13 @@ class MetaSyntheticEnv(gym.Env):
             true_next_ret = returns[t] # 假设 t 时刻预测 t+1 (简化，实际要有 shift)
             
             # Alpha 0: Oracle (高相关)
-            signals[t, 0, :] = true_next_ret + np.random.normal(0, 0.005, N)
+            signals[t, 0, :] = true_next_ret + np.random.normal(0, 0.00001, N)
             
             # Alpha 1: Inverse (反指)
             signals[t, 1, :] = -1 * true_next_ret + np.random.normal(0, 0.005, N)
             
             # Alpha 2: Noise (纯噪声)
-            signals[t, 2, :] = np.random.normal(0, 0.02, N)
+            signals[t, 2, :] = np.random.normal(0, 0.1, N)
             
             # Alpha 3: Regime Sensitive (牛市准，熊市瞎)
             if regimes[t] == 0: # Bull
@@ -105,56 +108,62 @@ class MetaSyntheticEnv(gym.Env):
         return self._get_obs(), {}
 
     def _get_obs(self):
-        # 简单 Observation: 
-        # 1. 过去 Lookback 天的真实收益 (T, N) -> Flatten
-        mkt_feat = self.returns[self.current_step-self.lookback:self.current_step].flatten()
+        # 1. 市场历史特征
+        # returns shape: (Total_Steps, N_Assets)
+        # 切片范围: [current_step - lookback : current_step]
+        window_start = self.current_step - self.lookback
+        window_end = self.current_step
         
-        # 2. 当期的 Alpha 信号预测值 (K, N) -> Flatten
-        #    RL 需要看到这些信号，结合 mkt_feat 来决定信谁
+        # 容错处理：如果刚开始，用 0 填充
+        if window_start < 0:
+            mkt_history = np.zeros((self.lookback, self.n_assets))
+            # 简单处理：把能取的取出来，剩下的补0 (或者直接由 Reset 保证 current_step >= lookback)
+            # 这里假设 Reset 已经设置 current_step = lookback，所以通常不会越界
+        else:
+            mkt_history = self.returns[window_start:window_end]
+            
+        mkt_feat = mkt_history.flatten()
+        
+        # 2. 当期 Alpha 信号
         alpha_feat = self.signals[self.current_step].flatten()
+
+        # --- 修改开始: 计算成绩单 (Past Performance) ---
+        # 我们要看过去 Lookback 天，谁预测得准
+        # 历史真实收益: mkt_history (L, N)
+        # 历史 Alpha 预测: self.signals[window_start:window_end] -> (L, K, N)
         
-        return np.concatenate([mkt_feat, alpha_feat]).astype(np.float32)
+        # 为了广播相减，扩展 mkt_history 维度: (L, N) -> (L, 1, N)
+        true_vals = mkt_history[:, np.newaxis, :]
+        pred_vals = self.signals[window_start:window_end]
+        
+        # 计算 MSE: (Pred - True)^2 -> Mean over Time(L) and Assets(N)
+        # 结果 shape: (K,) 即每个 Alpha 一个分值，越小越好
+        mse_scores = np.mean(np.square(pred_vals - true_vals), axis=(0, 2))
+        
+        # 可选：为了让神经网络好理解，可以取负对数或者倒数，或者直接归一化
+        # 这里直接传原始 MSE，由 VecNormalize 处理
+        perf_feat = mse_scores.astype(np.float32)
+        
+        return np.concatenate([mkt_feat, alpha_feat, perf_feat])
 
     def step(self, action):
         """
-        Action: (K,) 策略权重向量 (例如 [0.8, 0, 0.2, 0])
-        这里的 Action 不是最终资产权重，而是对 Signal 的加权
+        修改后的 Step:
+        接收的 action 已经是 Wrapper 算好的【资产权重】 (N_assets,)
         """
-        # 1. 归一化 Action (Softmax or L1 normalize)
-        alpha_weights = np.exp(action) / np.sum(np.exp(action))
+        # 1. 接收资产权重
+        self.weights = action 
         
-        # 2. 信号融合 (Meta-Aggregation)
-        # (K,) @ (K, N) -> (N,)
-        current_signals = self.signals[self.current_step] # (K, N)
-        blended_prediction = alpha_weights @ current_signals # (N,) 融合后的预测收益率
-        
-        # --- 这里通常连接 CvxpyLayer ---
-        # 但为了Env能独立运行测试，我们这里做一个简单的模拟优化
-        # 假设我们直接根据融合预测做 Long-Only
-        # (在实际训练中，这一步是在 Network Forward 里做的，Env 只接收最终资产权重)
-        # 为了兼容目前的 Step 接口，我们假设 Step 接收的是 'Alpha Weights'
-        # 然后我们在 Env 内部算 PnL (这其实是简化版，正规版应该由 Agent 输出 Asset Weights)
-        
-        # 真正的 Meta-RL 流程：
-        # Agent(Obs) -> Alpha_Weights -> CvxpyLayer(Alpha_Signals) -> Asset_Weights -> Env.step(Asset_Weights)
-        
-        # 为了方便 MVP，我们这里暂时假设 env.step 接收的是 Alpha_Weights，
-        # 并在内部简单模拟一个 "无约束优化" (即直接按预测值排序买入)
-        # *注意*：你在写 train.py 时，应该把 CvxpyLayer 放在 Policy Network 里，
-        # 让 Env 接收最终 Asset Weights。但为了测试 DGP，我们先这样写。
-        
-        # 临时逻辑：根据融合信号直接生成仓位
-        target_weights = np.maximum(blended_prediction, 0) # Long only
-        if np.sum(target_weights) > 1e-6:
-            target_weights /= np.sum(target_weights)
-        else:
-            target_weights = np.ones(self.n_assets) / self.n_assets
-            
-        # 3. 计算收益
+        # 2. 计算组合收益 (简单的一期收益)
+        # returns[t] 是 t 到 t+1 的收益
         true_ret = self.returns[self.current_step]
-        portfolio_ret = np.sum(target_weights * true_ret)
+        portfolio_ret = np.sum(self.weights * true_ret)
         
+        # 3. 推进时间
         self.current_step += 1
         done = self.current_step >= self.n_steps
         
-        return self._get_obs(), portfolio_ret, done, False, {"alpha_weights": alpha_weights}
+        # 4. 构造 Next Obs
+        next_obs = self._get_obs() if not done else np.zeros_like(self.observation_space.sample())
+        
+        return next_obs, portfolio_ret, done, False, {}
