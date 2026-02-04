@@ -63,7 +63,7 @@ def make_env(rank, seed=0):
 if __name__ == "__main__":
     # 配置参数
     N_ENVS = 8
-    TOTAL_TIMESTEPS = 300_000 
+    TOTAL_TIMESTEPS = 1_000_000 
     
     # 保持原来的 log 目录不变
     LOG_DIR = "./logs/meta_sac_sbx/"
@@ -99,7 +99,7 @@ if __name__ == "__main__":
         gamma=0.99,
         tau=0.005,
         tensorboard_log=LOG_DIR,
-        policy_kwargs=dict(net_arch=[256, 256]),
+        policy_kwargs=dict(net_arch=[128,128]),
     )
 
     print("🏃 开始训练 (Fixed Entropy + Normalized Obs)...")
